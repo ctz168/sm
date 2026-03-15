@@ -1,0 +1,58 @@
+# 分布式大模型推理系统 - Docker Compose配置
+#
+# 使用方法:
+#   docker-compose up -d          # 启动服务
+#   docker-compose logs -f        # 查看日志
+#   docker-compose down           # 停止服务
+
+version: '3.8'
+
+services:
+  # 资源感知模式（推荐）
+  inference:
+    build: .
+    container_name: distributed-llm
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./config:/app/config
+      - model-cache:/root/.cache/huggingface
+    environment:
+      - MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
+      - MIN_MEMORY_GB=2.0
+      - MIN_CPU_PERCENT=10.0
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # Pipeline模式 - 节点1
+  # pipeline-node-1:
+  #   build: .
+  #   container_name: pipeline-node-1
+  #   ports:
+  #     - "6000:6000"
+  #   environment:
+  #     - NODE_INDEX=0
+  #     - TOTAL_NODES=2
+  #   command: python download/node_pipeline_shard.py --index 0 --total 2 --port 6000
+
+  # Pipeline模式 - 节点2
+  # pipeline-node-2:
+  #   build: .
+  #   container_name: pipeline-node-2
+  #   ports:
+  #     - "6001:6001"
+  #   environment:
+  #     - NODE_INDEX=1
+  #     - TOTAL_NODES=2
+  #   command: python download/node_pipeline_shard.py --index 1 --total 2 --port 6001
+  #   depends_on:
+  #     - pipeline-node-1
+
+volumes:
+  model-cache:
+    driver: local

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**动态算力调度 · 自动故障恢复 · 资源感知启停**
+**一键安装 · 跨平台支持 · 傻瓜式使用**
 
 一个轻量级、生产级的分布式大模型推理系统，支持多节点协同推理。
 
@@ -10,192 +10,342 @@
 
 ---
 
-## 功能特性
+## ✨ 一键安装
 
-- ✅ **资源感知启停** - 资源不足自动停止，充足自动启动
-- ✅ **Pipeline并行分片** - 每个节点只加载部分层，内存节省33%
-- ✅ **去中心化架构** - 无单点故障，服务永不中断
-- ✅ **自动节点发现** - 节点自动发现和加入集群
-- ✅ **故障自动转移** - 领导者故障时自动重新选举
-
----
-
-## 四种部署模式
-
-### 模式一：资源感知模式（推荐，智能启停）
-
-**特点：资源不足时自动停止，充足时自动启动**
-
-```
-启动 → 检测资源 → 评估 → 启动模型/待机
-运行中 → 持续监控 → 资源不足 → 自动停止
-待机中 → 定期检测 → 资源充足 → 自动启动
-```
-
-### 模式二：Pipeline并行分片（内存最优）
-
-**特点：每个节点只加载部分层，内存效率最高**
-
-```
-┌─────────────┐     ┌─────────────┐
-│   节点 1    │────│   节点 2    │
-│ 层 0-11    │     │ 层 12-23   │
-│ 1.2GB      │     │ 1.2GB      │
-└─────────────┘     └─────────────┘
-```
-
-### 模式三：去中心化模式
-
-**特点：无单点故障，服务永不中断**
-
-```
-┌─────────┐     ┌─────────┐     ┌─────────┐
-│ 节点 A  │────│ 节点 B  │────│ 节点 C  │
-│(Leader) │     │(Follower)│    │(Follower)│
-└─────────┘     └─────────┘     └─────────┘
-```
-
-### 模式四：中心化模式
-
-**特点：有Web管理界面，适合监控需求**
-
----
-
-## 快速开始
-
-### 资源感知模式（推荐）
+### Linux / macOS
 
 ```bash
-# 安装依赖
-pip install torch transformers psutil
+# 一键安装
+curl -fsSL https://raw.githubusercontent.com/ctz168/sm/main/install.sh | bash
 
-# 启动服务（自动检测资源，智能启停）
-python download/node_resource_aware.py \
-    --model Qwen/Qwen2.5-0.5B-Instruct \
-    --port 7000 \
-    --min-memory 2.0 \
-    --min-cpu 10.0
+# 启动服务
+dllm-start
+
+# 或
+~/.distributed-llm/start.sh
 ```
 
-### Pipeline并行分片
+### Windows
+
+```powershell
+# 下载并运行安装脚本
+# 方法1: PowerShell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ctz168/sm/main/install.bat" -OutFile "install.bat"
+.\install.bat
+
+# 方法2: 直接下载
+# 访问 https://github.com/ctz168/sm 下载项目
+# 双击运行 install.bat
+```
+
+### Docker
 
 ```bash
-# 节点1: 层0-11
-python download/node_pipeline_shard.py \
-    --index 0 --total 2 --port 6000
+# 克隆项目
+git clone https://github.com/ctz168/sm.git
+cd sm
 
-# 节点2: 层12-23
-python download/node_pipeline_shard.py \
-    --index 1 --total 2 --port 6001
+# 启动服务
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
 ```
 
 ---
 
-## 资源感知功能详解
+## 🚀 快速使用
 
-### 工作原理
+### 启动服务
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      资源感知服务                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. 资源检测                                                │
-│     - 内存: 可用/总计                                       │
-│     - CPU: 空闲百分比                                       │
-│     - GPU: 显存（可选）                                     │
-│                                                             │
-│  2. 资源评估                                                │
-│     - 检查内存是否充足                                      │
-│     - 检查CPU是否空闲                                       │
-│     - 计算资源评分 (0-100)                                  │
-│                                                             │
-│  3. 动态启停                                                │
-│     - 资源充足 → 启动模型                                   │
-│     - 资源不足 → 停止模型，进入待机                         │
-│     - 每10秒检测一次                                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+**Linux/macOS:**
+```bash
+# 方式1: 使用快捷命令
+dllm-start
+
+# 方式2: 直接运行
+~/.distributed-llm/start.sh
+
+# 方式3: 指定模式
+./start.sh resource_aware   # 资源感知模式
+./start.sh pipeline         # Pipeline模式
+./start.sh decentralized    # 去中心化模式
 ```
 
-### API端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/health` | GET | 健康检查 |
-| `/status` | GET | 服务状态（含资源信息） |
-| `/resources` | GET | 资源详情 |
-| `/inference` | POST | 推理请求 |
-| `/check` | POST | 手动触发资源检测 |
-
-### 配置参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--min-memory` | 最小内存要求(GB) | 2.0 |
-| `--min-cpu` | 最小CPU空闲(%) | 10.0 |
-| `--model-memory` | 模型内存需求(GB) | 2.0 |
-
----
-
-## 内存对比
-
-| 模型 | 完整模型 | Pipeline 2节点 | 资源感知 |
-|------|---------|---------------|---------|
-| Qwen2.5-0.5B | 1.8GB | 1.2GB | 按需启停 |
-| Qwen2.5-7B | 14GB | 3.5GB | 按需启停 |
-| Qwen2.5-32B | 64GB | 8GB | 按需启停 |
-
----
-
-## 项目结构
-
+**Windows:**
+```cmd
+# 双击桌面快捷方式 "分布式大模型推理"
+# 或运行
+start.bat
 ```
-sm/
-├── download/
-│   ├── node_resource_aware.py     # 资源感知启停 ⭐
-│   ├── node_pipeline_shard.py     # Pipeline并行分片
-│   ├── node_decentralized.py      # 去中心化节点
-│   └── node_service_optimized.py  # 中心化节点
-│
-├── mini-services/
-│   └── orchestrator/              # 中央调度服务
-│
-├── scripts/
-│   └── start_decentralized.sh     # 启动脚本
-│
-└── README.md
+
+### 停止服务
+
+```bash
+# Linux/macOS
+dllm-stop
+# 或
+~/.distributed-llm/stop.sh
+
+# Windows
+stop.bat
+```
+
+### 查看状态
+
+```bash
+# Linux/macOS
+dllm-status
+# 或
+~/.distributed-llm/status.sh
+
+# Windows
+status.bat
 ```
 
 ---
 
-## 性能指标
+## 📋 四种运行模式
 
-### 资源感知模式
+### 1. 资源感知模式（推荐）
 
-| 指标 | 数值 |
-|------|------|
-| 检测间隔 | 10秒 |
-| 启动延迟 | ~5秒 |
-| 推理延迟 | 1.2秒 (20 tokens) |
+**特点：自动检测资源，智能启停**
 
-### 单节点性能 (Qwen2.5-0.5B, CPU)
+- 资源不足时自动停止模型
+- 资源充足时自动启动模型
+- 适合资源有限的环境
 
-| 指标 | 数值 |
-|------|------|
-| 模型加载 | 4秒 |
-| 推理延迟 | 2.6秒 (50 tokens) |
-| 吞吐量 | 18.9 tokens/s |
+```bash
+./start.sh 1
+# 或
+python download/node_resource_aware.py --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+### 2. Pipeline并行模式
+
+**特点：多节点分片，内存最优**
+
+- 每个节点只加载部分层
+- 内存使用降低50%
+- 支持运行更大的模型
+
+```bash
+# 节点1
+./start.sh 2
+# 输入: 节点索引=0, 总节点数=2
+
+# 节点2
+./start.sh 2
+# 输入: 节点索引=1, 总节点数=2
+```
+
+### 3. 去中心化模式
+
+**特点：无单点故障，高可用**
+
+- Raft共识算法
+- 自动领导者选举
+- 故障自动转移
+
+```bash
+./start.sh 3
+```
+
+### 4. 中心化模式
+
+**特点：有Web管理界面**
+
+- 需要先启动Orchestrator
+- 支持Web监控
+
+```bash
+./start.sh 4
+```
 
 ---
 
-## 许可证
+## 🔧 配置文件
+
+配置文件位置: `~/.distributed-llm/config/config.yaml`
+
+```yaml
+# 模型配置
+model:
+  name: "Qwen/Qwen2.5-0.5B-Instruct"
+  memory_gb: 2.0
+
+# 资源配置
+resources:
+  min_memory_gb: 2.0
+  min_cpu_percent: 10.0
+
+# 网络配置
+network:
+  host: "0.0.0.0"
+  port: 7000
+
+# 模式选择
+mode: "resource_aware"
+```
+
+---
+
+## 📡 API使用
+
+服务启动后，可以通过HTTP API访问：
+
+### 健康检查
+
+```bash
+curl http://localhost:7000/health
+# {"status": "healthy"}
+```
+
+### 查看状态
+
+```bash
+curl http://localhost:7000/status
+```
+
+### 推理请求
+
+```bash
+curl -X POST http://localhost:7000/inference \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "你好", "max_tokens": 50}'
+```
+
+### Python调用
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:7000/inference",
+    json={"prompt": "你好", "max_tokens": 50}
+)
+print(response.json())
+```
+
+---
+
+## 🖥️ 开机自启
+
+### Linux (systemd)
+
+```bash
+sudo cp /tmp/distributed-llm.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable distributed-llm
+sudo systemctl start distributed-llm
+```
+
+### macOS (launchd)
+
+```bash
+cp /tmp/com.distributed.llm.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.distributed.llm.plist
+```
+
+### Windows
+
+以管理员身份运行:
+```cmd
+%USERPROFILE%\.distributed-llm\install-service.bat
+```
+
+---
+
+## 📁 安装目录结构
+
+```
+~/.distributed-llm/
+├── sm/                    # 项目代码
+│   ├── download/          # 节点服务
+│   └── ...
+├── venv/                  # Python虚拟环境
+├── config/                # 配置文件
+│   └── config.yaml
+├── start.sh               # 启动脚本
+├── stop.sh                # 停止脚本
+└── status.sh              # 状态脚本
+```
+
+---
+
+## 🐳 Docker命令
+
+```bash
+# 构建镜像
+docker build -t distributed-llm .
+
+# 运行容器
+docker run -d -p 7000:7000 --name llm distributed-llm
+
+# 使用docker-compose
+docker-compose up -d        # 启动
+docker-compose logs -f      # 日志
+docker-compose down         # 停止
+docker-compose restart      # 重启
+```
+
+---
+
+## ❓ 常见问题
+
+### 1. 端口被占用
+
+```bash
+# 查看端口占用
+lsof -i :7000        # Linux/macOS
+netstat -ano | findstr :7000  # Windows
+
+# 修改端口
+# 编辑 config/config.yaml 中的 network.port
+```
+
+### 2. 内存不足
+
+```bash
+# 使用更小的模型
+# 编辑 config/config.yaml
+model:
+  name: "Qwen/Qwen2.5-0.5B-Instruct"
+```
+
+### 3. 模型下载慢
+
+```bash
+# 使用镜像
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+### 4. Python版本不兼容
+
+```bash
+# 需要 Python 3.8+
+python3 --version
+```
+
+---
+
+## 📊 性能指标
+
+| 模型 | 内存 | 延迟 | 吞吐量 |
+|------|------|------|--------|
+| Qwen2.5-0.5B | 1.8GB | 1.2s | 17 t/s |
+| Qwen2.5-1.5B | 3.5GB | 2.5s | 20 t/s |
+| Qwen2.5-7B | 14GB | 8s | 22 t/s |
+
+---
+
+## 📜 许可证
 
 MIT License
 
 ---
 
-## 致谢
+## 🙏 致谢
 
 - [Qwen](https://github.com/QwenLM/Qwen) - 模型支持
 - [Raft](https://raft.github.io/) - 共识算法
