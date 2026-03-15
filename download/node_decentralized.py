@@ -3,19 +3,17 @@
 分布式大模型推理系统 - 去中心化版本
 ====================================
 
-核心特性:
-1. 去中心化 - 无单点故障
-2. 自动发现 - 节点自动发现和加入
-3. 领导者选举 - Raft算法自动选举
-4. 故障转移 - 自动故障检测和恢复
-5. 动态算力 - 根据资源自动启停推理服务
-6. 高可用 - 只要有一个节点在线，服务就能运行
+特性:
+- 无单点故障
+- 自动主节点选举
+- 节点自动发现
+- 故障自动恢复
+- 只要有一个节点在线，服务就能运行
 
 架构:
-- 每个节点既是调度器也是推理节点
-- 使用Raft算法选举领导者
-- 领导者负责任务调度和状态同步
-- 所有节点都可以处理推理请求
+- P2P网络拓扑
+- Raft共识协议
+- 分布式状态存储
 """
 
 import os
@@ -25,10 +23,9 @@ import json
 import uuid
 import socket
 import threading
-import random
 import hashlib
-import signal
-from typing import Dict, List, Optional, Any, Tuple, Set
+import random
+from typing import Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -37,11 +34,11 @@ import struct
 import pickle
 
 try:
+    import socketio
     import psutil
-    HAS_PSUTIL = True
 except ImportError:
-    HAS_PSUTIL = False
-    print("警告: psutil未安装，部分功能不可用")
+    print("请安装: pip install python-socketio psutil")
+    sys.exit(1)
 
 try:
     import torch
@@ -49,7 +46,6 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-    print("警告: torch/transformers未安装，推理功能不可用")
 
 
 # ==================== 常量定义 ====================
@@ -61,437 +57,753 @@ class NodeState(Enum):
     LEADER = "leader"
 
 
-class ServiceState(Enum):
-    """服务状态"""
-    STARTING = "starting"
-    RUNNING = "running"
-    DEGRADED = "degraded"      # 降级模式（暂停推理）
-    STOPPED = "stopped"
-    ERROR = "error"
+class MessageType(Enum):
+    """消息类型"""
+    # 节点发现
+    DISCOVER = "discover"
+    DISCOVER_RESPONSE = "discover_response"
+    
+    # 心跳
+    HEARTBEAT = "heartbeat"
+    HEARTBEAT_RESPONSE = "heartbeat_response"
+    
+    # 选举
+    REQUEST_VOTE = "request_vote"
+    VOTE_RESPONSE = "vote_response"
+    
+    # 状态同步
+    STATE_SYNC = "state_sync"
+    STATE_SYNC_ACK = "state_sync_ack"
+    
+    # 任务
+    TASK_ASSIGN = "task_assign"
+    TASK_RESULT = "task_result"
+    
+    # 节点加入/离开
+    NODE_JOIN = "node_join"
+    NODE_LEAVE = "node_leave"
 
 
 # ==================== 配置 ====================
 
 @dataclass
-class Config:
-    """系统配置"""
-    # 网络配置
-    discovery_port: int = 37000        # 节点发现端口
-    communication_port: int = 37001    # 节点通信端口
-    api_port: int = 37002              # API端口
+class DecentralizedConfig:
+    """去中心化配置"""
+    # 节点配置
+    node_id: str = ""
+    node_name: str = ""
+    host: str = "0.0.0.0"
+    port: int = 5000
     
-    # Raft配置
-    heartbeat_interval: float = 1.0    # 心跳间隔(秒)
-    election_timeout_min: float = 2.0  # 选举超时最小值
-    election_timeout_max: float = 4.0  # 选举超时最大值
-    
-    # 资源配置
-    min_memory_gb: float = 2.0         # 最小内存要求
-    min_cpu_percent: float = 10.0      # 最小CPU空闲
-    
-    # 推理配置
+    # 模型配置
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_workers: int = 2
     
-    # 高可用配置
-    min_nodes_for_inference: int = 1   # 最少节点数才能开启推理
-    auto_recovery: bool = True         # 自动恢复
+    # 集群配置
+    seed_nodes: List[str] = field(default_factory=list)  # 种子节点列表
+    heartbeat_interval: float = 2.0  # 心跳间隔(秒)
+    election_timeout: float = 5.0  # 选举超时(秒)
+    leader_timeout: float = 10.0  # 主节点超时(秒)
+    
+    # 推理配置
+    min_nodes_for_inference: int = 1  # 最少节点数才开启推理
+    memory_limit_gb: float = 0.0
+    
+    def __post_init__(self):
+        if not self.node_id:
+            self.node_id = str(uuid.uuid4())
+        if not self.node_name:
+            self.node_name = f"Node-{self.node_id[:8]}"
+        if self.memory_limit_gb == 0:
+            self.memory_limit_gb = psutil.virtual_memory().total / (1024**3)
 
 
-# ==================== 节点信息 ====================
+# ==================== 分布式状态存储 ====================
 
 @dataclass
 class NodeInfo:
     """节点信息"""
     node_id: str
-    address: str
+    node_name: str
+    host: str
     port: int
-    state: NodeState = NodeState.FOLLOWER
-    term: int = 0
+    state: NodeState
+    is_leader: bool = False
     last_heartbeat: float = 0.0
-    
-    # 资源信息
-    cpu_cores: int = 0
-    memory_gb: float = 0.0
-    cpu_usage: float = 0.0
-    memory_usage: float = 0.0
-    
-    # 服务信息
-    service_state: ServiceState = ServiceState.STOPPED
     model_loaded: bool = False
-    can_inference: bool = False
-    
-    # 统计信息
-    tasks_completed: int = 0
-    uptime: float = 0.0
-    
-    def to_dict(self) -> Dict:
-        return {
-            "node_id": self.node_id,
-            "address": self.address,
-            "port": self.port,
-            "state": self.state.value,
-            "term": self.term,
-            "cpu_cores": self.cpu_cores,
-            "memory_gb": self.memory_gb,
-            "cpu_usage": self.cpu_usage,
-            "memory_usage": self.memory_usage,
-            "service_state": self.service_state.value,
-            "model_loaded": self.model_loaded,
-            "can_inference": self.can_inference,
-            "tasks_completed": self.tasks_completed,
-            "uptime": self.uptime,
-        }
+    model_name: str = ""
+    available_memory: int = 0
+    cpu_cores: int = 0
+    active_tasks: int = 0
+    max_workers: int = 2
+    term: int = 0  # 选举任期
 
 
-# ==================== 资源监控器 ====================
+@dataclass
+class TaskInfo:
+    """任务信息"""
+    task_id: str
+    prompt: str
+    status: str  # pending, running, completed, failed
+    assigned_node: Optional[str] = None
+    result: Optional[str] = None
+    created_at: float = 0.0
+    completed_at: float = 0.0
+    term: int = 0
 
-class ResourceMonitor:
-    """资源监控器"""
+
+class DistributedState:
+    """分布式状态存储"""
     
     def __init__(self):
-        self.min_memory_gb = 2.0
-        self.min_cpu_percent = 10.0
-    
-    def get_system_info(self) -> Dict:
-        """获取系统信息"""
-        info = {
-            "cpu_cores": os.cpu_count() or 4,
-            "memory_gb": 8.0,
-            "cpu_usage": 0.0,
-            "memory_usage": 0.0,
-            "available_memory_gb": 4.0,
-        }
+        self.lock = threading.RLock()
         
-        if HAS_PSUTIL:
-            memory = psutil.virtual_memory()
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            
-            info["memory_gb"] = memory.total / (1024**3)
-            info["cpu_usage"] = cpu_percent
-            info["memory_usage"] = memory.percent
-            info["available_memory_gb"] = memory.available / (1024**3)
-        
-        return info
-    
-    def can_run_inference(self, model_size_gb: float = 2.0) -> Tuple[bool, str]:
-        """检查是否可以运行推理"""
-        info = self.get_system_info()
-        
-        # 检查内存
-        if info["available_memory_gb"] < model_size_gb * 1.5:
-            return False, f"内存不足: 需要{model_size_gb * 1.5:.1f}GB, 可用{info['available_memory_gb']:.1f}GB"
-        
-        # 检查CPU
-        if info["cpu_usage"] > 90:
-            return False, f"CPU负载过高: {info['cpu_usage']:.1f}%"
-        
-        return True, "资源充足"
-    
-    def get_load_score(self) -> float:
-        """获取负载评分 (0-100, 越低越好)"""
-        info = self.get_system_info()
-        
-        # CPU负载评分
-        cpu_score = info["cpu_usage"]
-        
-        # 内存负载评分
-        memory_score = info["memory_usage"]
-        
-        # 综合评分
-        return cpu_score * 0.5 + memory_score * 0.5
-
-
-# ==================== 节点发现服务 ====================
-
-class NodeDiscovery:
-    """节点发现服务 - 使用UDP广播"""
-    
-    def __init__(self, config: Config, node_id: str, port: int):
-        self.config = config
-        self.node_id = node_id
-        self.port = port
-        self.known_nodes: Dict[str, NodeInfo] = {}
-        self.running = False
-        
-        self.broadcast_socket = None
-        self.listen_socket = None
-    
-    def start(self):
-        """启动发现服务"""
-        self.running = True
-        
-        # 创建广播socket
-        self.broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # 创建监听socket
-        self.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listen_socket.bind(('0.0.0.0', self.config.discovery_port))
-        self.listen_socket.settimeout(1.0)
-        
-        # 启动监听线程
-        threading.Thread(target=self._listen_loop, daemon=True).start()
-        
-        # 启动广播线程
-        threading.Thread(target=self._broadcast_loop, daemon=True).start()
-        
-        print(f"✅ 节点发现服务已启动 (端口: {self.config.discovery_port})")
-    
-    def stop(self):
-        """停止发现服务"""
-        self.running = False
-        if self.broadcast_socket:
-            self.broadcast_socket.close()
-        if self.listen_socket:
-            self.listen_socket.close()
-    
-    def _broadcast_loop(self):
-        """广播节点信息"""
-        while self.running:
-            try:
-                message = json.dumps({
-                    "type": "discovery",
-                    "node_id": self.node_id,
-                    "port": self.port,
-                    "timestamp": time.time(),
-                }).encode()
-                
-                self.broadcast_socket.sendto(
-                    message,
-                    ('<broadcast>', self.config.discovery_port)
-                )
-                
-            except Exception as e:
-                if self.running:
-                    print(f"[发现] 广播错误: {e}")
-            
-            time.sleep(5)  # 每5秒广播一次
-    
-    def _listen_loop(self):
-        """监听其他节点的广播"""
-        while self.running:
-            try:
-                data, addr = self.listen_socket.recvfrom(4096)
-                message = json.loads(data.decode())
-                
-                if message["type"] == "discovery":
-                    node_id = message["node_id"]
-                    if node_id != self.node_id:
-                        # 更新已知节点
-                        if node_id not in self.known_nodes:
-                            print(f"[发现] 发现新节点: {node_id} ({addr[0]})")
-                        
-                        self.known_nodes[node_id] = NodeInfo(
-                            node_id=node_id,
-                            address=addr[0],
-                            port=message["port"],
-                            last_heartbeat=time.time(),
-                        )
-                
-            except socket.timeout:
-                pass
-            except Exception as e:
-                if self.running:
-                    pass  # 忽略错误
-    
-    def get_nodes(self) -> List[NodeInfo]:
-        """获取所有已知节点"""
-        # 清理超时节点
-        current_time = time.time()
-        timeout = 30  # 30秒超时
-        
-        expired = [
-            node_id for node_id, node in self.known_nodes.items()
-            if current_time - node.last_heartbeat > timeout
-        ]
-        
-        for node_id in expired:
-            print(f"[发现] 节点超时: {node_id}")
-            del self.known_nodes[node_id]
-        
-        return list(self.known_nodes.values())
-
-
-# ==================== Raft共识实现 ====================
-
-class RaftNode:
-    """Raft共识节点"""
-    
-    def __init__(self, node_id: str, config: Config):
-        self.node_id = node_id
-        self.config = config
-        
-        # 持久状态
-        self.current_term = 0
-        self.voted_for: Optional[str] = None
-        
-        # 易失状态
-        self.state = NodeState.FOLLOWER
+        # 节点信息
+        self.nodes: Dict[str, NodeInfo] = {}
         self.leader_id: Optional[str] = None
         
-        # 选举超时
-        self.election_timeout = self._random_election_timeout()
-        self.last_heartbeat = time.time()
+        # 任务信息
+        self.tasks: Dict[str, TaskInfo] = {}
+        self.pending_tasks: List[str] = []
+        self.completed_tasks: List[str] = []
         
-        # 领导者状态
-        self.next_index: Dict[str, int] = {}
-        self.match_index: Dict[str, int] = {}
+        # 选举状态
+        self.current_term: int = 0
+        self.voted_for: Optional[str] = None
+        self.last_log_index: int = 0
+        self.last_log_term: int = 0
         
         # 日志
         self.log: List[Dict] = []
-        self.commit_index = 0
-        self.last_applied = 0
-        
-        # 投票
-        self.votes_received: Set[str] = set()
-        
-        # 锁
-        self.lock = threading.Lock()
     
-    def _random_election_timeout(self) -> float:
-        """随机选举超时"""
-        return random.uniform(
-            self.config.election_timeout_min,
-            self.config.election_timeout_max
-        )
-    
-    def tick(self) -> Optional[str]:
-        """
-        时钟滴答，返回需要执行的动作
-        返回: "election" 表示需要开始选举
-        """
+    def add_node(self, node: NodeInfo):
+        """添加节点"""
         with self.lock:
-            current_time = time.time()
-            
-            if self.state == NodeState.LEADER:
-                # 领导者发送心跳
-                return "heartbeat"
-            
-            elif self.state in [NodeState.FOLLOWER, NodeState.CANDIDATE]:
-                # 检查选举超时
-                if current_time - self.last_heartbeat > self.election_timeout:
-                    return "election"
-            
+            self.nodes[node.node_id] = node
+    
+    def remove_node(self, node_id: str):
+        """移除节点"""
+        with self.lock:
+            if node_id in self.nodes:
+                del self.nodes[node_id]
+            if self.leader_id == node_id:
+                self.leader_id = None
+    
+    def get_node(self, node_id: str) -> Optional[NodeInfo]:
+        """获取节点"""
+        with self.lock:
+            return self.nodes.get(node_id)
+    
+    def get_active_nodes(self) -> List[NodeInfo]:
+        """获取活跃节点"""
+        with self.lock:
+            now = time.time()
+            return [
+                node for node in self.nodes.values()
+                if now - node.last_heartbeat < 30  # 30秒内有心跳
+            ]
+    
+    def get_nodes_for_inference(self) -> List[NodeInfo]:
+        """获取可用于推理的节点"""
+        with self.lock:
+            now = time.time()
+            return [
+                node for node in self.nodes.values()
+                if (node.model_loaded and 
+                    now - node.last_heartbeat < 30 and
+                    node.active_tasks < node.max_workers)
+            ]
+    
+    def set_leader(self, leader_id: str, term: int):
+        """设置主节点"""
+        with self.lock:
+            self.leader_id = leader_id
+            self.current_term = term
+            if leader_id in self.nodes:
+                self.nodes[leader_id].is_leader = True
+                self.nodes[leader_id].state = NodeState.LEADER
+    
+    def add_task(self, task: TaskInfo):
+        """添加任务"""
+        with self.lock:
+            self.tasks[task.task_id] = task
+            if task.status == "pending":
+                self.pending_tasks.append(task.task_id)
+    
+    def update_task(self, task_id: str, **kwargs):
+        """更新任务"""
+        with self.lock:
+            if task_id in self.tasks:
+                task = self.tasks[task_id]
+                for key, value in kwargs.items():
+                    if hasattr(task, key):
+                        setattr(task, key, value)
+                
+                if kwargs.get("status") == "completed":
+                    if task_id in self.pending_tasks:
+                        self.pending_tasks.remove(task_id)
+                    self.completed_tasks.append(task_id)
+    
+    def get_next_task(self) -> Optional[TaskInfo]:
+        """获取下一个待处理任务"""
+        with self.lock:
+            if self.pending_tasks:
+                task_id = self.pending_tasks.pop(0)
+                return self.tasks.get(task_id)
             return None
     
-    def become_candidate(self):
-        """成为候选人"""
+    def to_dict(self) -> Dict:
+        """序列化为字典"""
         with self.lock:
-            self.state = NodeState.CANDIDATE
-            self.current_term += 1
-            self.voted_for = self.node_id
-            self.votes_received = {self.node_id}
-            self.leader_id = None
-            self.election_timeout = self._random_election_timeout()
-            
-            print(f"[Raft] 成为候选人 (任期: {self.current_term})")
+            return {
+                "nodes": {
+                    nid: {
+                        "node_id": n.node_id,
+                        "node_name": n.node_name,
+                        "host": n.host,
+                        "port": n.port,
+                        "state": n.state.value,
+                        "is_leader": n.is_leader,
+                        "last_heartbeat": n.last_heartbeat,
+                        "model_loaded": n.model_loaded,
+                        "model_name": n.model_name,
+                        "available_memory": n.available_memory,
+                        "cpu_cores": n.cpu_cores,
+                        "active_tasks": n.active_tasks,
+                        "max_workers": n.max_workers,
+                    }
+                    for nid, n in self.nodes.items()
+                },
+                "leader_id": self.leader_id,
+                "current_term": self.current_term,
+                "pending_tasks": len(self.pending_tasks),
+                "completed_tasks": len(self.completed_tasks),
+            }
     
-    def become_leader(self):
-        """成为领导者"""
+    def from_dict(self, data: Dict):
+        """从字典反序列化"""
         with self.lock:
-            self.state = NodeState.LEADER
-            self.leader_id = self.node_id
+            for nid, n in data.get("nodes", {}).items():
+                self.nodes[nid] = NodeInfo(
+                    node_id=n["node_id"],
+                    node_name=n["node_name"],
+                    host=n["host"],
+                    port=n["port"],
+                    state=NodeState(n["state"]),
+                    is_leader=n["is_leader"],
+                    last_heartbeat=n["last_heartbeat"],
+                    model_loaded=n["model_loaded"],
+                    model_name=n["model_name"],
+                    available_memory=n["available_memory"],
+                    cpu_cores=n["cpu_cores"],
+                    active_tasks=n["active_tasks"],
+                    max_workers=n["max_workers"],
+                )
             
-            print(f"[Raft] 成为领导者 (任期: {self.current_term})")
-    
-    def become_follower(self, term: int, leader_id: str):
-        """成为跟随者"""
-        with self.lock:
-            self.state = NodeState.FOLLOWER
-            self.current_term = term
-            self.leader_id = leader_id
-            self.voted_for = None
-            self.last_heartbeat = time.time()
-            self.election_timeout = self._random_election_timeout()
-    
-    def receive_heartbeat(self, term: int, leader_id: str) -> bool:
-        """接收心跳"""
-        with self.lock:
-            if term >= self.current_term:
-                self.current_term = term
-                self.state = NodeState.FOLLOWER
-                self.leader_id = leader_id
-                self.last_heartbeat = time.time()
-                self.election_timeout = self._random_election_timeout()
-                return True
-            return False
-    
-    def request_vote(self, term: int, candidate_id: str) -> Tuple[bool, int]:
-        """处理投票请求"""
-        with self.lock:
-            if term > self.current_term:
-                self.current_term = term
-                self.state = NodeState.FOLLOWER
-                self.voted_for = None
-            
-            vote_granted = False
-            if term >= self.current_term:
-                if self.voted_for is None or self.voted_for == candidate_id:
-                    self.voted_for = candidate_id
-                    vote_granted = True
-                    self.last_heartbeat = time.time()
-            
-            return vote_granted, self.current_term
-    
-    def receive_vote(self, term: int, voter_id: str, vote_granted: bool) -> bool:
-        """接收投票"""
-        with self.lock:
-            if self.state != NodeState.CANDIDATE:
-                return False
-            
-            if term != self.current_term:
-                return False
-            
-            if vote_granted:
-                self.votes_received.add(voter_id)
-            
-            return False
-    
-    def is_leader(self) -> bool:
-        return self.state == NodeState.LEADER
-    
-    def get_leader(self) -> Optional[str]:
-        return self.leader_id
+            self.leader_id = data.get("leader_id")
+            self.current_term = data.get("current_term", 0)
 
 
-# ==================== 推理引擎 ====================
+# ==================== 网络通信 ====================
 
-class InferenceEngine:
-    """推理引擎"""
+class P2PNetwork:
+    """P2P网络通信"""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: DecentralizedConfig, state: DistributedState):
         self.config = config
-        self.model = None
-        self.tokenizer = None
-        self.loaded = False
-        self.model_size_gb = 2.0
-        self.resource_monitor = ResourceMonitor()
+        self.state = state
+        self.node_id = config.node_id
         
-        # 统计
-        self.stats = {
-            "total_requests": 0,
-            "total_tokens": 0,
-            "total_latency": 0.0,
-        }
+        # 已知节点
+        self.known_nodes: Set[str] = set()
+        self.node_connections: Dict[str, socketio.Client] = {}
+        
+        # 消息处理器
+        self.message_handlers: Dict[MessageType, callable] = {}
+        
+        # Socket.IO服务器
+        self.sio: Optional[socketio.AsyncServer] = None
+        self.server_running = False
+        
+        # 客户端连接
+        self.client_sio = socketio.Client(
+            reconnection=True,
+            reconnection_attempts=5,
+            logger=False,
+            engineio_logger=False
+        )
     
-    def load(self) -> bool:
-        """加载模型"""
-        if not HAS_TORCH:
-            print("❌ PyTorch未安装，无法加载模型")
-            return False
+    def register_handler(self, msg_type: MessageType, handler: callable):
+        """注册消息处理器"""
+        self.message_handlers[msg_type] = handler
+    
+    async def start_server(self):
+        """启动P2P服务器"""
+        from aiohttp import web
+        import socketio as sio
         
-        # 检查资源
-        can_run, reason = self.resource_monitor.can_run_inference(self.model_size_gb)
-        if not can_run:
-            print(f"❌ 资源不足: {reason}")
-            return False
+        self.sio = sio.AsyncServer(
+            cors_allowed_origins='*',
+            async_mode='aiohttp'
+        )
+        app = web.Application()
+        self.sio.attach(app)
+        
+        # 注册事件处理
+        @self.sio.event
+        async def connect(sid, environ):
+            print(f"[P2P] 节点连接: {sid}")
+        
+        @self.sio.event
+        async def disconnect(sid):
+            print(f"[P2P] 节点断开: {sid}")
+        
+        @self.sio.on('message')
+        async def on_message(sid, data):
+            await self._handle_message(sid, data)
+        
+        # 启动服务器
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, self.config.host, self.config.port)
+        await site.start()
+        
+        self.server_running = True
+        print(f"[P2P] 服务器启动: {self.config.host}:{self.config.port}")
+    
+    async def _handle_message(self, sid: str, data: Dict):
+        """处理接收到的消息"""
+        try:
+            msg_type = MessageType(data.get("type"))
+            msg_data = data.get("data", {})
+            
+            if msg_type in self.message_handlers:
+                handler = self.message_handlers[msg_type]
+                result = await handler(msg_data)
+                
+                # 发送响应
+                if result and data.get("request_id"):
+                    await self.sio.emit('message', {
+                        "type": msg_type.value + "_response",
+                        "data": result,
+                        "request_id": data["request_id"]
+                    }, room=sid)
+        except Exception as e:
+            print(f"[P2P] 消息处理错误: {e}")
+    
+    def connect_to_node(self, host: str, port: int) -> bool:
+        """连接到其他节点"""
+        node_addr = f"{host}:{port}"
+        
+        if node_addr in self.node_connections:
+            return True
         
         try:
-            print(f"📥 加载模型: {self.config.model_name}")
+            client = socketio.Client(
+                reconnection=True,
+                reconnection_attempts=3,
+                logger=False,
+                engineio_logger=False
+            )
             
+            client.connect(f"http://{host}:{port}", transports=['polling'])
+            self.node_connections[node_addr] = client
+            self.known_nodes.add(node_addr)
+            
+            print(f"[P2P] 已连接到节点: {node_addr}")
+            return True
+            
+        except Exception as e:
+            print(f"[P2P] 连接失败 {node_addr}: {e}")
+            return False
+    
+    def send_message(self, node_addr: str, msg_type: MessageType, 
+                     data: Dict, wait_response: bool = False) -> Optional[Dict]:
+        """发送消息到节点"""
+        if node_addr not in self.node_connections:
+            return None
+        
+        client = self.node_connections[node_addr]
+        request_id = str(uuid.uuid4())
+        
+        message = {
+            "type": msg_type.value,
+            "data": data,
+            "request_id": request_id,
+            "from_node": self.node_id
+        }
+        
+        if wait_response:
+            # 同步等待响应
+            response_event = threading.Event()
+            response_data = {"data": None}
+            
+            def on_response(data):
+                response_data["data"] = data
+                response_event.set()
+            
+            client.on('message', on_response)
+            client.emit('message', message)
+            
+            if response_event.wait(timeout=5):
+                return response_data["data"]
+            return None
+        else:
+            client.emit('message', message)
+            return None
+    
+    def broadcast(self, msg_type: MessageType, data: Dict):
+        """广播消息到所有已知节点"""
+        message = {
+            "type": msg_type.value,
+            "data": data,
+            "from_node": self.node_id,
+            "timestamp": time.time()
+        }
+        
+        for node_addr, client in list(self.node_connections.items()):
+            try:
+                client.emit('message', message)
+            except:
+                del self.node_connections[node_addr]
+
+
+# ==================== Raft共识协议 ====================
+
+class RaftConsensus:
+    """Raft共识协议实现"""
+    
+    def __init__(self, config: DecentralizedConfig, state: DistributedState, network: P2PNetwork):
+        self.config = config
+        self.state = state
+        self.network = network
+        self.node_id = config.node_id
+        
+        # 节点状态
+        self.node_state = NodeState.FOLLOWER
+        self.current_term = 0
+        self.voted_for: Optional[str] = None
+        
+        # 选举相关
+        self.last_heartbeat = time.time()
+        self.election_timer: Optional[threading.Timer] = None
+        self.votes_received: Set[str] = set()
+        
+        # 心跳
+        self.heartbeat_thread: Optional[threading.Thread] = None
+        
+        # 回调
+        self.on_become_leader: Optional[callable] = None
+        self.on_become_follower: Optional[callable] = None
+    
+    def start(self):
+        """启动共识协议"""
+        # 注册消息处理器
+        self.network.register_handler(
+            MessageType.REQUEST_VOTE, 
+            self._handle_vote_request
+        )
+        self.network.register_handler(
+            MessageType.VOTE_RESPONSE,
+            self._handle_vote_response
+        )
+        self.network.register_handler(
+            MessageType.HEARTBEAT,
+            self._handle_heartbeat
+        )
+        
+        # 启动选举定时器
+        self._reset_election_timer()
+        
+        print(f"[Raft] 共识协议启动, 初始状态: {self.node_state.value}")
+    
+    def _reset_election_timer(self):
+        """重置选举定时器"""
+        if self.election_timer:
+            self.election_timer.cancel()
+        
+        # 随机超时时间，避免同时选举
+        timeout = self.config.election_timeout + random.random() * 2
+        
+        self.election_timer = threading.Timer(timeout, self._start_election)
+        self.election_timer.daemon = True
+        self.election_timer.start()
+    
+    def _start_election(self):
+        """开始选举"""
+        if self.node_state == NodeState.LEADER:
+            self._reset_election_timer()
+            return
+        
+        print(f"[Raft] 开始选举, 任期 {self.current_term + 1}")
+        
+        # 转为候选人
+        self.node_state = NodeState.CANDIDATE
+        self.current_term += 1
+        self.voted_for = self.node_id
+        self.votes_received = {self.node_id}  # 投自己一票
+        
+        # 向所有节点请求投票
+        vote_request = {
+            "term": self.current_term,
+            "candidate_id": self.node_id,
+            "last_log_index": self.state.last_log_index,
+            "last_log_term": self.state.last_log_term,
+        }
+        
+        self.network.broadcast(MessageType.REQUEST_VOTE, vote_request)
+        
+        # 重置选举定时器
+        self._reset_election_timer()
+    
+    async def _handle_vote_request(self, data: Dict) -> Dict:
+        """处理投票请求"""
+        term = data.get("term", 0)
+        candidate_id = data.get("candidate_id")
+        
+        response = {
+            "term": self.current_term,
+            "vote_granted": False
+        }
+        
+        # 如果请求的任期更高，更新自己的任期
+        if term > self.current_term:
+            self.current_term = term
+            self.voted_for = None
+            self.node_state = NodeState.FOLLOWER
+        
+        # 判断是否投票
+        if term < self.current_term:
+            return response
+        
+        if self.voted_for is None or self.voted_for == candidate_id:
+            self.voted_for = candidate_id
+            response["vote_granted"] = True
+            self.last_heartbeat = time.time()
+            self._reset_election_timer()
+            print(f"[Raft] 投票给 {candidate_id}")
+        
+        return response
+    
+    async def _handle_vote_response(self, data: Dict):
+        """处理投票响应"""
+        if self.node_state != NodeState.CANDIDATE:
+            return
+        
+        term = data.get("term", 0)
+        vote_granted = data.get("vote_granted", False)
+        voter_id = data.get("voter_id", "")
+        
+        if term > self.current_term:
+            # 发现更高任期，转为follower
+            self.current_term = term
+            self.node_state = NodeState.FOLLOWER
+            self.voted_for = None
+            return
+        
+        if vote_granted:
+            self.votes_received.add(voter_id)
+            
+            # 检查是否获得多数票
+            total_nodes = len(self.state.nodes) + 1  # +1 是自己
+            majority = total_nodes // 2 + 1
+            
+            if len(self.votes_received) >= majority:
+                self._become_leader()
+    
+    async def _handle_heartbeat(self, data: Dict) -> Dict:
+        """处理心跳"""
+        term = data.get("term", 0)
+        leader_id = data.get("leader_id")
+        
+        if term >= self.current_term:
+            self.current_term = term
+            self.node_state = NodeState.FOLLOWER
+            self.state.set_leader(leader_id, term)
+            self.last_heartbeat = time.time()
+            self._reset_election_timer()
+        
+        return {
+            "term": self.current_term,
+            "node_id": self.node_id
+        }
+    
+    def _become_leader(self):
+        """成为主节点"""
+        print(f"[Raft] 成为主节点! 任期 {self.current_term}")
+        
+        self.node_state = NodeState.LEADER
+        self.state.set_leader(self.node_id, self.current_term)
+        
+        # 启动心跳线程
+        if self.heartbeat_thread is None or not self.heartbeat_thread.is_alive():
+            self.heartbeat_thread = threading.Thread(target=self._send_heartbeats, daemon=True)
+            self.heartbeat_thread.start()
+        
+        # 回调
+        if self.on_become_leader:
+            self.on_become_leader()
+    
+    def _send_heartbeats(self):
+        """发送心跳"""
+        while self.node_state == NodeState.LEADER:
+            heartbeat = {
+                "term": self.current_term,
+                "leader_id": self.node_id,
+                "state": self.state.to_dict()
+            }
+            
+            self.network.broadcast(MessageType.HEARTBEAT, heartbeat)
+            time.sleep(self.config.heartbeat_interval)
+
+
+# ==================== 去中心化节点 ====================
+
+class DecentralizedNode:
+    """去中心化节点"""
+    
+    def __init__(self, config: DecentralizedConfig):
+        self.config = config
+        self.node_id = config.node_id
+        
+        # 组件
+        self.state = DistributedState()
+        self.network = P2PNetwork(config, self.state)
+        self.consensus = RaftConsensus(config, self.state, self.network)
+        
+        # 推理引擎
+        self.model = None
+        self.tokenizer = None
+        self.model_loaded = False
+        self.active_tasks = 0
+        
+        # 运行状态
+        self.running = False
+        
+        # 注册回调
+        self.consensus.on_become_leader = self._on_become_leader
+        self.consensus.on_become_follower = self._on_become_follower
+    
+    def start(self):
+        """启动节点"""
+        print(f"\n{'='*60}")
+        print(f"  分布式大模型推理系统 - 去中心化节点")
+        print(f"{'='*60}")
+        print(f"  节点ID: {self.node_id}")
+        print(f"  节点名称: {self.config.node_name}")
+        print(f"  监听地址: {self.config.host}:{self.config.port}")
+        print(f"  模型: {self.config.model_name}")
+        print(f"{'='*60}\n")
+        
+        self.running = True
+        
+        # 注册自己
+        self._register_self()
+        
+        # 连接种子节点
+        self._connect_to_seeds()
+        
+        # 启动共识协议
+        self.consensus.start()
+        
+        # 启动节点发现
+        self._start_discovery()
+        
+        # 启动任务处理
+        self._start_task_processor()
+        
+        # 主循环
+        try:
+            while self.running:
+                time.sleep(1)
+                self._check_inference_readiness()
+        except KeyboardInterrupt:
+            self.stop()
+    
+    def _register_self(self):
+        """注册自己"""
+        memory = psutil.virtual_memory()
+        
+        self.state.add_node(NodeInfo(
+            node_id=self.node_id,
+            node_name=self.config.node_name,
+            host=self.config.host,
+            port=self.config.port,
+            state=NodeState.FOLLOWER,
+            last_heartbeat=time.time(),
+            model_loaded=False,
+            model_name=self.config.model_name,
+            available_memory=int(memory.available / (1024**2)),
+            cpu_cores=os.cpu_count() or 4,
+            active_tasks=0,
+            max_workers=self.config.max_workers
+        ))
+    
+    def _connect_to_seeds(self):
+        """连接到种子节点"""
+        for seed in self.config.seed_nodes:
+            try:
+                host, port = seed.split(":")
+                self.network.connect_to_node(host, int(port))
+            except Exception as e:
+                print(f"[发现] 连接种子节点失败 {seed}: {e}")
+    
+    def _start_discovery(self):
+        """启动节点发现"""
+        def discovery_loop():
+            while self.running:
+                # 广播发现消息
+                self.network.broadcast(MessageType.DISCOVER, {
+                    "node_id": self.node_id,
+                    "node_name": self.config.node_name,
+                    "host": self.config.host,
+                    "port": self.config.port,
+                })
+                
+                time.sleep(10)
+        
+        thread = threading.Thread(target=discovery_loop, daemon=True)
+        thread.start()
+    
+    def _start_task_processor(self):
+        """启动任务处理器"""
+        def process_loop():
+            while self.running:
+                # 只有主节点分配任务
+                if self.consensus.node_state == NodeState.LEADER:
+                    self._assign_tasks()
+                
+                # 处理分配给自己的任务
+                self._process_assigned_tasks()
+                
+                time.sleep(0.5)
+        
+        thread = threading.Thread(target=process_loop, daemon=True)
+        thread.start()
+    
+    def _check_inference_readiness(self):
+        """检查是否应该开启推理"""
+        active_nodes = self.state.get_active_nodes()
+        node_count = len(active_nodes)
+        
+        # 检查是否满足最少节点数
+        if node_count >= self.config.min_nodes_for_inference:
+            if not self.model_loaded:
+                self._load_model()
+        else:
+            # 节点不足，卸载模型节省资源
+            if self.model_loaded and self.active_tasks == 0:
+                self._unload_model()
+    
+    def _load_model(self):
+        """加载模型"""
+        if not HAS_TORCH:
+            print("[模型] PyTorch未安装，无法加载模型")
+            return
+        
+        print(f"[模型] 加载模型: {self.config.model_name}")
+        
+        try:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model_name,
                 trust_remote_code=True
@@ -505,19 +817,19 @@ class InferenceEngine:
             )
             self.model.eval()
             
-            # 计算模型大小
-            param_count = sum(p.numel() for p in self.model.parameters())
-            self.model_size_gb = param_count * 4 / (1024**3)
+            self.model_loaded = True
             
-            self.loaded = True
-            print(f"✅ 模型加载完成 ({self.model_size_gb:.2f}GB)")
-            return True
+            # 更新状态
+            node = self.state.get_node(self.node_id)
+            if node:
+                node.model_loaded = True
+            
+            print(f"[模型] 加载完成")
             
         except Exception as e:
-            print(f"❌ 模型加载失败: {e}")
-            return False
+            print(f"[模型] 加载失败: {e}")
     
-    def unload(self):
+    def _unload_model(self):
         """卸载模型"""
         if self.model:
             del self.model
@@ -526,411 +838,158 @@ class InferenceEngine:
             del self.tokenizer
             self.tokenizer = None
         
-        self.loaded = False
+        self.model_loaded = False
         
-        # 清理内存
-        if HAS_TORCH and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 更新状态
+        node = self.state.get_node(self.node_id)
+        if node:
+            node.model_loaded = False
         
         import gc
         gc.collect()
         
-        print("📤 模型已卸载")
+        print(f"[模型] 已卸载")
     
-    def generate(self, prompt: str, max_tokens: int = 100) -> Tuple[str, int, float]:
-        """生成文本"""
-        if not self.loaded:
-            raise RuntimeError("模型未加载")
+    def _on_become_leader(self):
+        """成为主节点回调"""
+        print(f"[主节点] 成为集群主节点")
         
-        start_time = time.time()
+        # 主节点需要加载模型
+        if not self.model_loaded:
+            self._load_model()
+    
+    def _on_become_follower(self):
+        """成为从节点回调"""
+        print(f"[从节点] 成为集群从节点")
+    
+    def _assign_tasks(self):
+        """分配任务（主节点执行）"""
+        task = self.state.get_next_task()
+        if not task:
+            return
         
-        # 编码
-        inputs = self.tokenizer(prompt, return_tensors="pt")
+        # 找到可用节点
+        available_nodes = self.state.get_nodes_for_inference()
+        if not available_nodes:
+            # 没有可用节点，任务放回队列
+            self.state.pending_tasks.insert(0, task.task_id)
+            return
         
-        # 生成
-        with torch.no_grad():
-            outputs = self.model.generate(
-                inputs.input_ids,
-                max_new_tokens=max_tokens,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
+        # 选择负载最低的节点
+        best_node = min(available_nodes, key=lambda n: n.active_tasks)
         
-        # 解码
-        new_tokens = outputs.shape[1] - inputs.input_ids.shape[1]
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True
+        # 分配任务
+        self.state.update_task(
+            task.task_id,
+            status="running",
+            assigned_node=best_node.node_id
         )
         
-        latency = time.time() - start_time
+        # 发送任务到节点
+        node_addr = f"{best_node.host}:{best_node.port}"
+        self.network.send_message(node_addr, MessageType.TASK_ASSIGN, {
+            "task_id": task.task_id,
+            "prompt": task.prompt
+        })
         
-        # 更新统计
-        self.stats["total_requests"] += 1
-        self.stats["total_tokens"] += new_tokens
-        self.stats["total_latency"] += latency
-        
-        return response, new_tokens, latency
+        print(f"[任务] 分配 {task.task_id[:8]} 到 {best_node.node_name}")
     
-    def can_inference(self) -> Tuple[bool, str]:
-        """检查是否可以推理"""
-        if not self.loaded:
-            return False, "模型未加载"
-        
-        return self.resource_monitor.can_run_inference(self.model_size_gb)
-
-
-# ==================== 去中心化节点 ====================
-
-class DecentralizedNode:
-    """去中心化节点"""
+    def _process_assigned_tasks(self):
+        """处理分配给自己的任务"""
+        # 检查是否有分配给自己的任务
+        for task in list(self.state.tasks.values()):
+            if (task.assigned_node == self.node_id and 
+                task.status == "running" and
+                self.model_loaded and
+                self.active_tasks < self.config.max_workers):
+                
+                threading.Thread(
+                    target=self._execute_task,
+                    args=(task,),
+                    daemon=True
+                ).start()
     
-    def __init__(self, config: Config):
-        self.config = config
-        self.node_id = self._generate_node_id()
-        self.start_time = time.time()
+    def _execute_task(self, task: TaskInfo):
+        """执行推理任务"""
+        self.active_tasks += 1
         
-        # 组件
-        self.raft = RaftNode(self.node_id, config)
-        self.discovery = NodeDiscovery(config, self.node_id, config.api_port)
-        self.engine = InferenceEngine(config)
-        self.resource_monitor = ResourceMonitor()
-        
-        # 状态
-        self.running = False
-        self.service_state = ServiceState.STARTING
-        
-        # 任务队列
-        self.task_queue: List[Dict] = []
-        self.task_results: Dict[str, Dict] = {}
-        
-        # 网络
-        self.api_socket: Optional[socket.socket] = None
-    
-    def _generate_node_id(self) -> str:
-        """生成节点ID"""
-        # 基于MAC地址和端口生成唯一ID
         try:
-            mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff) 
-                          for elements in range(0,2*6,2)][::-1])
-        except:
-            mac = str(uuid.uuid4())[:8]
+            # 推理
+            inputs = self.tokenizer(task.prompt, return_tensors="pt")
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=256,
+                    temperature=0.7,
+                    do_sample=True
+                )
+            
+            result = self.tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True
+            )
+            
+            # 更新任务状态
+            self.state.update_task(
+                task.task_id,
+                status="completed",
+                result=result,
+                completed_at=time.time()
+            )
+            
+            print(f"[任务] 完成 {task.task_id[:8]}")
+            
+        except Exception as e:
+            self.state.update_task(
+                task.task_id,
+                status="failed",
+                result=str(e)
+            )
+            print(f"[任务] 失败 {task.task_id[:8]}: {e}")
         
-        return f"node-{mac}-{random.randint(1000, 9999)}"
+        finally:
+            self.active_tasks -= 1
     
-    def start(self):
-        """启动节点"""
-        print(f"\n{'='*60}")
-        print(f"  分布式大模型推理系统 - 去中心化节点")
-        print(f"{'='*60}")
-        print(f"  节点ID: {self.node_id}")
-        print(f"  API端口: {self.config.api_port}")
-        print(f"{'='*60}\n")
+    def submit_task(self, prompt: str) -> str:
+        """提交任务"""
+        task_id = str(uuid.uuid4())
         
-        self.running = True
-        self.service_state = ServiceState.STARTING
+        task = TaskInfo(
+            task_id=task_id,
+            prompt=prompt,
+            status="pending",
+            created_at=time.time(),
+            term=self.state.current_term
+        )
         
-        # 启动发现服务
-        self.discovery.start()
+        self.state.add_task(task)
         
-        # 启动API服务
-        self._start_api_server()
-        
-        # 启动主循环
-        threading.Thread(target=self._main_loop, daemon=True).start()
-        
-        # 启动资源监控
-        threading.Thread(target=self._resource_loop, daemon=True).start()
-        
-        print("✅ 节点启动完成\n")
+        print(f"[任务] 提交 {task_id[:8]}")
+        return task_id
+    
+    def get_status(self) -> Dict:
+        """获取状态"""
+        return {
+            "node_id": self.node_id,
+            "node_name": self.config.node_name,
+            "node_state": self.consensus.node_state.value,
+            "is_leader": self.consensus.node_state == NodeState.LEADER,
+            "leader_id": self.state.leader_id,
+            "current_term": self.state.current_term,
+            "model_loaded": self.model_loaded,
+            "active_nodes": len(self.state.get_active_nodes()),
+            "pending_tasks": len(self.state.pending_tasks),
+            "active_tasks": self.active_tasks,
+            "cluster_state": self.state.to_dict()
+        }
     
     def stop(self):
         """停止节点"""
-        print("\n🛑 正在停止节点...")
+        print("\n[节点] 正在停止...")
         self.running = False
-        self.service_state = ServiceState.STOPPED
-        
-        # 卸载模型
-        if self.engine.loaded:
-            self.engine.unload()
-        
-        # 停止发现服务
-        self.discovery.stop()
-        
-        # 关闭API
-        if self.api_socket:
-            self.api_socket.close()
-        
-        print("✅ 节点已停止")
-    
-    def _start_api_server(self):
-        """启动API服务器"""
-        self.api_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.api_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.api_socket.bind(('0.0.0.0', self.config.api_port))
-        self.api_socket.listen(10)
-        self.api_socket.settimeout(1.0)
-        
-        threading.Thread(target=self._api_loop, daemon=True).start()
-        
-        print(f"✅ API服务已启动 (端口: {self.config.api_port})")
-    
-    def _api_loop(self):
-        """API请求处理循环"""
-        while self.running:
-            try:
-                conn, addr = self.api_socket.accept()
-                threading.Thread(target=self._handle_api_request, args=(conn, addr), daemon=True).start()
-            except socket.timeout:
-                pass
-            except Exception as e:
-                if self.running:
-                    pass
-    
-    def _handle_api_request(self, conn: socket.socket, addr: Tuple[str, int]):
-        """处理API请求"""
-        try:
-            data = conn.recv(4096)
-            if not data:
-                return
-            
-            request = json.loads(data.decode())
-            response = self._process_request(request)
-            
-            conn.sendall(json.dumps(response).encode())
-            
-        except Exception as e:
-            try:
-                conn.sendall(json.dumps({"error": str(e)}).encode())
-            except:
-                pass
-        finally:
-            conn.close()
-    
-    def _process_request(self, request: Dict) -> Dict:
-        """处理请求"""
-        request_type = request.get("type", "unknown")
-        
-        if request_type == "status":
-            return self._get_status()
-        
-        elif request_type == "inference":
-            return self._handle_inference(request)
-        
-        elif request_type == "heartbeat":
-            # Raft心跳
-            term = request.get("term", 0)
-            leader_id = request.get("leader_id", "")
-            self.raft.receive_heartbeat(term, leader_id)
-            return {"success": True}
-        
-        elif request_type == "vote_request":
-            # 投票请求
-            term = request.get("term", 0)
-            candidate_id = request.get("candidate_id", "")
-            granted, current_term = self.raft.request_vote(term, candidate_id)
-            return {"vote_granted": granted, "term": current_term}
-        
-        else:
-            return {"error": "Unknown request type"}
-    
-    def _get_status(self) -> Dict:
-        """获取状态"""
-        info = self.resource_monitor.get_system_info()
-        
-        return {
-            "node_id": self.node_id,
-            "state": self.raft.state.value,
-            "term": self.raft.current_term,
-            "leader_id": self.raft.get_leader(),
-            "service_state": self.service_state.value,
-            "model_loaded": self.engine.loaded,
-            "uptime": time.time() - self.start_time,
-            "known_nodes": len(self.discovery.known_nodes),
-            **info,
-            "stats": self.engine.stats,
-        }
-    
-    def _handle_inference(self, request: Dict) -> Dict:
-        """处理推理请求"""
-        # 检查是否可以推理
-        if not self.engine.loaded:
-            # 尝试加载模型
-            if not self._try_load_model():
-                return {"error": "无法加载模型，资源不足"}
-        
-        # 检查资源
-        can_run, reason = self.engine.can_inference()
-        if not can_run:
-            return {"error": f"资源不足: {reason}"}
-        
-        # 执行推理
-        prompt = request.get("prompt", "")
-        max_tokens = request.get("max_tokens", 100)
-        
-        try:
-            response, tokens, latency = self.engine.generate(prompt, max_tokens)
-            return {
-                "success": True,
-                "response": response,
-                "tokens": tokens,
-                "latency": latency,
-                "node_id": self.node_id,
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def _main_loop(self):
-        """主循环"""
-        while self.running:
-            # Raft时钟滴答
-            action = self.raft.tick()
-            
-            if action == "election":
-                # 开始选举
-                self._start_election()
-            
-            elif action == "heartbeat":
-                # 发送心跳
-                self._send_heartbeats()
-            
-            time.sleep(0.1)
-    
-    def _start_election(self):
-        """开始选举"""
-        self.raft.become_candidate()
-        
-        # 向所有已知节点请求投票
-        nodes = self.discovery.get_nodes()
-        votes_needed = (len(nodes) + 1) // 2 + 1  # 多数票
-        
-        for node in nodes:
-            threading.Thread(
-                target=self._request_vote_from_node,
-                args=(node,),
-                daemon=True
-            ).start()
-        
-        # 等待投票结果
-        time.sleep(self.config.election_timeout_min / 2)
-        
-        # 检查是否获得多数票
-        if len(self.raft.votes_received) >= votes_needed:
-            self.raft.become_leader()
-            self._on_become_leader()
-    
-    def _request_vote_from_node(self, node: NodeInfo):
-        """向节点请求投票"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2.0)
-            sock.connect((node.address, node.port))
-            
-            request = {
-                "type": "vote_request",
-                "term": self.raft.current_term,
-                "candidate_id": self.node_id,
-            }
-            
-            sock.sendall(json.dumps(request).encode())
-            response = json.loads(sock.recv(4096).decode())
-            
-            if response.get("vote_granted"):
-                self.raft.receive_vote(
-                    response.get("term", 0),
-                    node.node_id,
-                    True
-                )
-            
-            sock.close()
-            
-        except Exception as e:
-            pass
-    
-    def _send_heartbeats(self):
-        """发送心跳"""
-        nodes = self.discovery.get_nodes()
-        
-        for node in nodes:
-            threading.Thread(
-                target=self._send_heartbeat_to_node,
-                args=(node,),
-                daemon=True
-            ).start()
-    
-    def _send_heartbeat_to_node(self, node: NodeInfo):
-        """向节点发送心跳"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
-            sock.connect((node.address, node.port))
-            
-            request = {
-                "type": "heartbeat",
-                "term": self.raft.current_term,
-                "leader_id": self.node_id,
-            }
-            
-            sock.sendall(json.dumps(request).encode())
-            sock.close()
-            
-        except Exception as e:
-            pass
-    
-    def _on_become_leader(self):
-        """成为领导者时的回调"""
-        print(f"[领导者] 我已成为领导者")
-        
-        # 尝试加载模型
-        self._try_load_model()
-    
-    def _resource_loop(self):
-        """资源监控循环"""
-        while self.running:
-            # 检查资源
-            can_run, reason = self.resource_monitor.can_run_inference(2.0)
-            
-            if can_run and not self.engine.loaded:
-                # 资源充足，尝试加载模型
-                if self.config.auto_recovery:
-                    self._try_load_model()
-            
-            elif not can_run and self.engine.loaded:
-                # 资源不足，卸载模型
-                print(f"[资源] 资源不足，卸载模型: {reason}")
-                self.engine.unload()
-                self.service_state = ServiceState.DEGRADED
-            
-            # 更新服务状态
-            if self.engine.loaded:
-                self.service_state = ServiceState.RUNNING
-            else:
-                self.service_state = ServiceState.DEGRADED
-            
-            time.sleep(10)
-    
-    def _try_load_model(self) -> bool:
-        """尝试加载模型"""
-        if self.engine.loaded:
-            return True
-        
-        can_run, reason = self.resource_monitor.can_run_inference(2.0)
-        if not can_run:
-            print(f"[资源] 无法加载模型: {reason}")
-            return False
-        
-        return self.engine.load()
-    
-    def run_forever(self):
-        """运行直到停止"""
-        self.start()
-        
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.stop()
+        self._unload_model()
+        print("[节点] 已停止")
 
 
 # ==================== 主函数 ====================
@@ -939,28 +998,38 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="分布式大模型推理 - 去中心化节点")
-    parser.add_argument("--port", "-p", type=int, default=37002, help="API端口")
+    
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--port", "-p", type=int, default=5000, help="监听端口")
+    parser.add_argument("--name", "-n", default=None, help="节点名称")
     parser.add_argument("--model", "-m", default="Qwen/Qwen2.5-0.5B-Instruct", help="模型名称")
-    parser.add_argument("--discovery-port", type=int, default=37000, help="发现端口")
+    parser.add_argument("--seeds", "-s", default="", help="种子节点列表，逗号分隔")
+    parser.add_argument("--workers", "-w", type=int, default=2, help="并行工作线程")
+    parser.add_argument("--min-nodes", type=int, default=1, help="最少节点数才开启推理")
     
     args = parser.parse_args()
     
-    config = Config(
-        discovery_port=args.discovery_port,
-        api_port=args.port,
+    # 解析种子节点
+    seed_nodes = []
+    if args.seeds:
+        seed_nodes = [s.strip() for s in args.seeds.split(",")]
+    
+    config = DecentralizedConfig(
+        node_name=args.name,
+        host=args.host,
+        port=args.port,
         model_name=args.model,
+        seed_nodes=seed_nodes,
+        max_workers=args.workers,
+        min_nodes_for_inference=args.min_nodes
     )
     
     node = DecentralizedNode(config)
     
-    def signal_handler(sig, frame):
+    try:
+        node.start()
+    except KeyboardInterrupt:
         node.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    node.run_forever()
 
 
 if __name__ == "__main__":
