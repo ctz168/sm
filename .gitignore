@@ -47,14 +47,10 @@ Thumbs.db
 
 # Project specific
 pids/
-db/*.db
-db/*.sqlite
-.next-force-rebuild
-
-# Temporary files
+db/
+.cache/
 *.tmp
 *.temp
-.cache/
 
-# Upload files (optional, uncomment if needed)
-# upload/
+# Model cache (optional, uncomment if needed)
+# ~/.cache/huggingface/
