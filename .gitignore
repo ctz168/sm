@@ -27,6 +27,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# PIDs
+pids/
+
 # Environment
 .env
 .env.local
@@ -45,12 +48,10 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Project specific
-pids/
-db/
-.cache/
+# Temporary
 *.tmp
 *.temp
+.cache/
 
-# Model cache (optional, uncomment if needed)
+# Model cache (optional)
 # ~/.cache/huggingface/
