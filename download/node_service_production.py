@@ -399,12 +399,19 @@ class ProductionNodeService:
         self.stats = PerformanceStats()
         self.network = NetworkMetrics()
         
-        # Socket.IO
+        # 重连计数
+        self._reconnect_attempt = 0
+        self._max_reconnect_attempts = 10
+        
+        # Socket.IO - 配置指数退避重连
         self.sio = socketio.Client(
             reconnection=True,
-            reconnection_attempts=10,
-            reconnection_delay=1,
-            reconnection_delay_max=5
+            reconnection_attempts=self._max_reconnect_attempts,
+            reconnection_delay=1,        # 初始延迟1秒
+            reconnection_delay_max=60,   # 最大延迟60秒
+            reconnection_delay_multiplier=2,  # 指数退避
+            logger=False,                # 禁用内置日志
+            engineio_logger=False        # 禁用Engine.IO日志
         )
         
         # 状态
@@ -454,16 +461,22 @@ class ProductionNodeService:
         def connect():
             print(f"✅ 已连接到服务器: {self.server_url}")
             self.connected = True
+            self._reconnect_attempt = 0  # 重置重连计数
             self._register()
         
         @self.sio.event
         def disconnect():
             print("❌ 与服务器断开连接")
             self.connected = False
+            # 自动重连由Socket.IO客户端处理
         
         @self.sio.event
         def connect_error(data):
-            print(f"❌ 连接错误: {data}")
+            self._reconnect_attempt += 1
+            # 指数退避延迟
+            delay = min(2 ** self._reconnect_attempt, 60)  # 最大60秒
+            print(f"❌ 连接错误 (尝试 {self._reconnect_attempt}): {data}")
+            print(f"   将在 {delay} 秒后重试...")
         
         @self.sio.on('node:registered')
         def on_registered(data):
@@ -484,6 +497,16 @@ class ProductionNodeService:
             
             task_id = data.get('taskId')
             prompt = data.get('prompt', '')
+            
+            # 输入验证
+            if not prompt or len(prompt) > 10000:
+                self.sio.emit('inference:result', {
+                    'taskId': task_id,
+                    'status': 'failed',
+                    'error': '无效的输入'
+                })
+                return
+            
             params = {
                 'max_tokens': data.get('maxTokens', 256),
                 'temperature': data.get('temperature', 0.7),

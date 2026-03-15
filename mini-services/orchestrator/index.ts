@@ -164,6 +164,57 @@ const PARALLEL_CONFIG = {
 let batchQueue: string[] = [];
 let batchTimer: NodeJS.Timeout | null = null;
 
+// ==================== 生产级配置 ====================
+
+// 日志级别
+enum LogLevel { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3 }
+const LOG_LEVEL = LogLevel.INFO;
+
+// 速率限制
+const RATE_LIMIT_WINDOW = 60000; // 1分钟
+const RATE_LIMIT_MAX = 100; // 每分钟最多100个请求
+const rateLimitMap: Map<string, number[]> = new Map();
+
+// 优雅关闭
+let isShuttingDown = false;
+
+// ==================== 工具函数 ====================
+
+function log(level: LogLevel, context: string, message: string, data?: any): void {
+  if (level < LOG_LEVEL) return;
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level: LogLevel[level],
+    context,
+    message,
+    ...(data && { data })
+  };
+  if (level >= LogLevel.ERROR) console.error(JSON.stringify(entry));
+  else if (level >= LogLevel.WARN) console.warn(JSON.stringify(entry));
+  else console.log(JSON.stringify(entry));
+}
+
+function checkRateLimit(identifier: string): boolean {
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW;
+  let timestamps = rateLimitMap.get(identifier) || [];
+  timestamps = timestamps.filter(t => t > windowStart);
+  if (timestamps.length >= RATE_LIMIT_MAX) return false;
+  timestamps.push(now);
+  rateLimitMap.set(identifier, timestamps);
+  return true;
+}
+
+function validateInput(prompt: string): { valid: boolean; error?: string } {
+  if (!prompt || typeof prompt !== 'string') {
+    return { valid: false, error: '提示词不能为空' };
+  }
+  if (prompt.length > 10000) {
+    return { valid: false, error: '提示词长度不能超过10000字符' };
+  }
+  return { valid: true };
+}
+
 // ==================== HTTP服务器 ====================
 
 const httpServer = createServer();
@@ -173,12 +224,14 @@ const io = new IOServer(httpServer, {
     origin: '*',
     methods: ['GET', 'POST']
   },
-  transports: ['polling', 'websocket'], // 先polling后websocket
-  allowEIO3: true, // 兼容旧版本
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  upgradeTimeout: 30000,
-  maxHttpBufferSize: 1e8
+  transports: ['polling', 'websocket'], // polling优先，更稳定
+  allowEIO3: true, // 兼容旧版本客户端
+  pingTimeout: 60000,      // 心跳超时60秒
+  pingInterval: 25000,     // 心跳间隔25秒
+  upgradeTimeout: 30000,   // 升级超时30秒
+  maxHttpBufferSize: 1e8,  // 最大消息大小100MB
+  allowUpgrades: true,     // 允许升级
+  cookie: false            // 不使用cookie
 });
 
 const PORT = 3003;
@@ -1274,23 +1327,192 @@ const apiServer = createHttpServer((req: IncomingMessage, res: ServerResponse) =
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// ==================== 健康检查端点 ====================
+
+// 健康检查
+apiServer.on('request', (req: any, res: any) => {
+  if (req.url === '/health' && req.method === 'GET') {
+    const health = {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      nodes: {
+        total: nodes.size,
+        online: Array.from(nodes.values()).filter(n => n.status === 'online').length,
+        busy: Array.from(nodes.values()).filter(n => n.status === 'busy').length,
+        offline: Array.from(nodes.values()).filter(n => n.status === 'offline').length,
+      },
+      tasks: {
+        pending: pendingTasks.length,
+        processing: processingTasks.length,
+        queueSize: batchQueue.length,
+      },
+      memory: {
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      }
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(health, null, 2));
+    return;
+  }
+  
+  // 就绪检查
+  if (req.url === '/ready' && req.method === 'GET') {
+    const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online').length;
+    const isReady = onlineNodes > 0;
+    res.writeHead(isReady ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ready: isReady, nodes: onlineNodes }));
+    return;
+  }
+  
+  // Prometheus指标
+  if (req.url === '/metrics' && req.method === 'GET') {
+    const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online').length;
+    const busyNodes = Array.from(nodes.values()).filter(n => n.status === 'busy').length;
+    const metrics = [
+      `# HELP llm_nodes_total Total number of nodes`,
+      `# TYPE llm_nodes_total gauge`,
+      `llm_nodes_total{status="all"} ${nodes.size}`,
+      `llm_nodes_total{status="online"} ${onlineNodes}`,
+      `llm_nodes_total{status="busy"} ${busyNodes}`,
+      `llm_nodes_total{status="offline"} ${nodes.size - onlineNodes - busyNodes}`,
+      ``,
+      `# HELP llm_tasks_pending Number of pending tasks`,
+      `# TYPE llm_tasks_pending gauge`,
+      `llm_tasks_pending ${pendingTasks.length}`,
+      ``,
+      `# HELP llm_tasks_processing Number of processing tasks`,
+      `# TYPE llm_tasks_processing gauge`,
+      `llm_tasks_processing ${processingTasks.length}`,
+      ``,
+      `# HELP llm_tasks_completed_total Total completed tasks`,
+      `# TYPE llm_tasks_completed_total counter`,
+      `llm_tasks_completed_total ${Array.from(nodes.values()).reduce((sum, n) => sum + n.performance.tasksCompleted, 0)}`,
+      ``,
+      `# HELP llm_memory_heap_bytes Process heap memory in bytes`,
+      `# TYPE llm_memory_heap_bytes gauge`,
+      `llm_memory_heap_bytes{type="used"} ${process.memoryUsage().heapUsed}`,
+      `llm_memory_heap_bytes{type="total"} ${process.memoryUsage().heapTotal}`,
+    ].join('\n');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(metrics);
+    return;
+  }
+});
+
+// ==================== 定期清理任务 ====================
+
+function startCleanupTask(): void {
+  setInterval(() => {
+    const now = Date.now();
+    const maxAge = 3600000; // 1小时
+    
+    // 清理已完成的旧任务
+    let cleanedTasks = 0;
+    tasks.forEach((task, taskId) => {
+      if (task.status === 'completed' || task.status === 'failed') {
+        const age = now - (task.completedAt?.getTime() || task.createdAt.getTime());
+        if (age > maxAge) {
+          tasks.delete(taskId);
+          cleanedTasks++;
+        }
+      }
+    });
+    
+    // 清理离线节点数据（24小时后）
+    let cleanedNodes = 0;
+    nodes.forEach((node, nodeId) => {
+      if (node.status === 'offline') {
+        const age = now - node.lastHeartbeat.getTime();
+        if (age > maxAge * 24) {
+          nodes.delete(nodeId);
+          cleanedNodes++;
+        }
+      }
+    });
+    
+    // 清理速率限制缓存
+    const windowStart = now - RATE_LIMIT_WINDOW;
+    rateLimitMap.forEach((timestamps, key) => {
+      const valid = timestamps.filter(t => t > windowStart);
+      if (valid.length === 0) {
+        rateLimitMap.delete(key);
+      } else {
+        rateLimitMap.set(key, valid);
+      }
+    });
+    
+    if (cleanedTasks > 0 || cleanedNodes > 0) {
+      log(LogLevel.INFO, 'Cleanup', `清理完成: ${cleanedTasks}个任务, ${cleanedNodes}个节点`);
+    }
+  }, 300000); // 每5分钟清理一次
+}
+
+// ==================== 优雅关闭 ====================
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  
+  log(LogLevel.INFO, 'Shutdown', `收到 ${signal} 信号，开始优雅关闭...`);
+  
+  // 1. 停止接受新连接
+  io.close(() => {
+    log(LogLevel.INFO, 'Shutdown', 'Socket.IO 服务已关闭');
+  });
+  
+  // 2. 等待正在处理的任务完成
+  const processingCount = processingTasks.length;
+  if (processingCount > 0) {
+    log(LogLevel.INFO, 'Shutdown', `等待 ${processingCount} 个任务完成...`);
+    
+    // 最多等待30秒
+    setTimeout(() => {
+      log(LogLevel.WARN, 'Shutdown', '等待超时，强制关闭');
+      process.exit(1);
+    }, 30000);
+    
+    // 检查任务是否完成
+    const checkInterval = setInterval(() => {
+      if (processingTasks.length === 0) {
+        clearInterval(checkInterval);
+        log(LogLevel.INFO, 'Shutdown', '所有任务已完成');
+        process.exit(0);
+      }
+    }, 1000);
+  } else {
+    log(LogLevel.INFO, 'Shutdown', '没有正在处理的任务');
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // ==================== 启动服务 ====================
 
 setInterval(checkNodeTimeout, 15000);
 setInterval(processNextTask, 1000);
+startCleanupTask();
 
 initializeQwenModel();
 
 io.listen(httpServer);
 httpServer.listen(PORT, () => {
-  console.log(`\n🚀 分布式大模型推理系统 - 并行计算增强版`);
+  console.log(`\n🚀 分布式大模型推理系统 - 生产级版本`);
   console.log(`   WebSocket: ws://localhost:${PORT}`);
   console.log(`   HTTP API:  http://localhost:${PORT + 1}`);
+  console.log(`   健康检查:  http://localhost:${PORT + 1}/health`);
+  console.log(`   就绪检查:  http://localhost:${PORT + 1}/ready`);
+  console.log(`   监控指标:  http://localhost:${PORT + 1}/metrics`);
   console.log(`\n⚙️  并行计算配置:`);
   console.log(`   最大批处理: ${PARALLEL_CONFIG.MAX_BATCH_SIZE}`);
   console.log(`   最大并行度: ${PARALLEL_CONFIG.MAX_PARALLELISM}`);
   console.log(`   批处理超时: ${PARALLEL_CONFIG.BATCH_TIMEOUT}ms`);
   console.log(`   任务超时: ${PARALLEL_CONFIG.TASK_TIMEOUT}ms`);
+  console.log(`   速率限制: ${RATE_LIMIT_MAX} 请求/分钟`);
 });
 
 apiServer.listen(PORT + 1, () => {
