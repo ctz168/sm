@@ -1264,6 +1264,77 @@ const apiServer = createHttpServer((req: IncomingMessage, res: ServerResponse) =
     return;
   }
   
+  // 健康检查端点
+  if (req.url === '/health' && req.method === 'GET') {
+    const health = {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      nodes: {
+        total: nodes.size,
+        online: Array.from(nodes.values()).filter(n => n.status === 'online').length,
+        busy: Array.from(nodes.values()).filter(n => n.status === 'busy').length,
+        offline: Array.from(nodes.values()).filter(n => n.status === 'offline').length,
+      },
+      tasks: {
+        pending: pendingTasks.length,
+        processing: processingTasks.length,
+        queueSize: batchQueue.length,
+      },
+      memory: {
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      }
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(health, null, 2));
+    return;
+  }
+  
+  // 就绪检查端点
+  if (req.url === '/ready' && req.method === 'GET') {
+    const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online').length;
+    const isReady = onlineNodes > 0;
+    res.writeHead(isReady ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ready: isReady, nodes: onlineNodes }));
+    return;
+  }
+  
+  // Prometheus指标端点
+  if (req.url === '/metrics' && req.method === 'GET') {
+    const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online').length;
+    const busyNodes = Array.from(nodes.values()).filter(n => n.status === 'busy').length;
+    const metrics = [
+      `# HELP llm_nodes_total Total number of nodes`,
+      `# TYPE llm_nodes_total gauge`,
+      `llm_nodes_total{status="all"} ${nodes.size}`,
+      `llm_nodes_total{status="online"} ${onlineNodes}`,
+      `llm_nodes_total{status="busy"} ${busyNodes}`,
+      `llm_nodes_total{status="offline"} ${nodes.size - onlineNodes - busyNodes}`,
+      ``,
+      `# HELP llm_tasks_pending Number of pending tasks`,
+      `# TYPE llm_tasks_pending gauge`,
+      `llm_tasks_pending ${pendingTasks.length}`,
+      ``,
+      `# HELP llm_tasks_processing Number of processing tasks`,
+      `# TYPE llm_tasks_processing gauge`,
+      `llm_tasks_processing ${processingTasks.length}`,
+      ``,
+      `# HELP llm_tasks_completed_total Total completed tasks`,
+      `# TYPE llm_tasks_completed_total counter`,
+      `llm_tasks_completed_total ${Array.from(nodes.values()).reduce((sum, n) => sum + n.performance.tasksCompleted, 0)}`,
+      ``,
+      `# HELP llm_memory_heap_bytes Process heap memory in bytes`,
+      `# TYPE llm_memory_heap_bytes gauge`,
+      `llm_memory_heap_bytes{type="used"} ${process.memoryUsage().heapUsed}`,
+      `llm_memory_heap_bytes{type="total"} ${process.memoryUsage().heapTotal}`,
+    ].join('\n');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(metrics);
+    return;
+  }
+  
   if (req.url === '/api/status' && req.method === 'GET') {
     const metrics = getSystemMetrics();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1327,80 +1398,12 @@ const apiServer = createHttpServer((req: IncomingMessage, res: ServerResponse) =
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ==================== 健康检查端点 ====================
+// ==================== 健康检查端点（整合到主请求处理） ====================
 
-// 健康检查
-apiServer.on('request', (req: any, res: any) => {
-  if (req.url === '/health' && req.method === 'GET') {
-    const health = {
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      nodes: {
-        total: nodes.size,
-        online: Array.from(nodes.values()).filter(n => n.status === 'online').length,
-        busy: Array.from(nodes.values()).filter(n => n.status === 'busy').length,
-        offline: Array.from(nodes.values()).filter(n => n.status === 'offline').length,
-      },
-      tasks: {
-        pending: pendingTasks.length,
-        processing: processingTasks.length,
-        queueSize: batchQueue.length,
-      },
-      memory: {
-        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      }
-    };
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(health, null, 2));
-    return;
-  }
-  
-  // 就绪检查
-  if (req.url === '/ready' && req.method === 'GET') {
-    const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online').length;
-    const isReady = onlineNodes > 0;
-    res.writeHead(isReady ? 200 : 503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ready: isReady, nodes: onlineNodes }));
-    return;
-  }
-  
-  // Prometheus指标
-  if (req.url === '/metrics' && req.method === 'GET') {
-    const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online').length;
-    const busyNodes = Array.from(nodes.values()).filter(n => n.status === 'busy').length;
-    const metrics = [
-      `# HELP llm_nodes_total Total number of nodes`,
-      `# TYPE llm_nodes_total gauge`,
-      `llm_nodes_total{status="all"} ${nodes.size}`,
-      `llm_nodes_total{status="online"} ${onlineNodes}`,
-      `llm_nodes_total{status="busy"} ${busyNodes}`,
-      `llm_nodes_total{status="offline"} ${nodes.size - onlineNodes - busyNodes}`,
-      ``,
-      `# HELP llm_tasks_pending Number of pending tasks`,
-      `# TYPE llm_tasks_pending gauge`,
-      `llm_tasks_pending ${pendingTasks.length}`,
-      ``,
-      `# HELP llm_tasks_processing Number of processing tasks`,
-      `# TYPE llm_tasks_processing gauge`,
-      `llm_tasks_processing ${processingTasks.length}`,
-      ``,
-      `# HELP llm_tasks_completed_total Total completed tasks`,
-      `# TYPE llm_tasks_completed_total counter`,
-      `llm_tasks_completed_total ${Array.from(nodes.values()).reduce((sum, n) => sum + n.performance.tasksCompleted, 0)}`,
-      ``,
-      `# HELP llm_memory_heap_bytes Process heap memory in bytes`,
-      `# TYPE llm_memory_heap_bytes gauge`,
-      `llm_memory_heap_bytes{type="used"} ${process.memoryUsage().heapUsed}`,
-      `llm_memory_heap_bytes{type="total"} ${process.memoryUsage().heapTotal}`,
-    ].join('\n');
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(metrics);
-    return;
-  }
-});
+// 注意：健康检查端点已在主API请求处理中实现
+// GET /health - 健康检查
+// GET /ready - 就绪检查  
+// GET /metrics - Prometheus指标
 
 // ==================== 定期清理任务 ====================
 
