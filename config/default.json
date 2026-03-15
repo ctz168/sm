@@ -1,0 +1,91 @@
+{
+  "system": {
+    "name": "分布式大模型推理系统",
+    "version": "2.0.0",
+    "description": "动态算力调度 · 自动故障恢复"
+  },
+  
+  "orchestrator": {
+    "websocketPort": 3003,
+    "httpPort": 3004,
+    "host": "0.0.0.0"
+  },
+  
+  "web": {
+    "port": 3000,
+    "host": "0.0.0.0"
+  },
+  
+  "scheduling": {
+    "heartbeatTimeout": 60000,
+    "heartbeatInterval": 30000,
+    "maxRetries": 3,
+    "taskTimeout": 30000,
+    "rebalanceInterval": 60000
+  },
+  
+  "parallel": {
+    "maxBatchSize": 8,
+    "batchTimeout": 100,
+    "minParallelism": 1,
+    "maxParallelism": 16,
+    "loadBalanceThreshold": 0.7
+  },
+  
+  "sharding": {
+    "replicationFactor": 2,
+    "migrationTimeout": 300000,
+    "minNodesForModel": 3
+  },
+  
+  "models": {
+    "default": {
+      "name": "Qwen 2.5 27B",
+      "modelId": "qwen2.5-27b-q4",
+      "quantization": "Q4_K_M",
+      "totalShards": 7,
+      "minMemory": 4096
+    },
+    "available": [
+      {
+        "name": "Qwen 2.5 0.5B",
+        "modelId": "Qwen/Qwen2.5-0.5B-Instruct",
+        "memory": 1024,
+        "recommended": "适合测试和演示"
+      },
+      {
+        "name": "Qwen 2.5 1.5B",
+        "modelId": "Qwen/Qwen2.5-1.5B-Instruct",
+        "memory": 3072,
+        "recommended": "适合4-8GB内存"
+      },
+      {
+        "name": "Qwen 2.5 3B",
+        "modelId": "Qwen/Qwen2.5-3B-Instruct",
+        "memory": 6144,
+        "recommended": "适合8-16GB内存"
+      },
+      {
+        "name": "Qwen 2.5 7B",
+        "modelId": "Qwen/Qwen2.5-7B-Instruct",
+        "memory": 14336,
+        "recommended": "适合16-32GB内存"
+      }
+    ]
+  },
+  
+  "logging": {
+    "level": "info",
+    "maxLogs": 100,
+    "file": "logs/system.log"
+  },
+  
+  "monitoring": {
+    "metricsInterval": 5000,
+    "alertThreshold": {
+      "cpu": 90,
+      "memory": 90,
+      "loadScore": 80
+    }
+  }
+}
