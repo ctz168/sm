@@ -1,0 +1,17 @@
+# 分布式大模型推理系统 - Python依赖
+
+# 核心依赖
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+
+# 网络通信
+python-socketio>=5.8.0
+
+# 系统监控
+psutil>=5.9.0
+
+# 可选依赖
+# sentencepiece  # 某些模型需要
+# protobuf       # 某些模型需要
+# bitsandbytes   # 量化支持

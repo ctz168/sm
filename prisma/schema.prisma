@@ -1,0 +1,111 @@
+// 分布式大模型推理系统 - 数据库Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// 计算节点
+model ComputeNode {
+  id            String   @id @default(cuid())
+  nodeId        String   @unique // 节点唯一标识
+  name          String   // 节点名称
+  os            String   // 操作系统
+  cpuCores      Int      // CPU核心数
+  totalMemory   Int      // 总内存(MB)
+  availableMemory Int    // 可用内存(MB)
+  ipAddress     String?  // IP地址
+  port          Int?     // 端口
+  status        String   @default("offline") // online, offline, busy, error
+  lastHeartbeat DateTime? // 最后心跳时间
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // 关联
+  shards        ModelShard[] // 该节点存储的模型分片
+  tasks         Task[]       // 该节点执行的任务
+}
+
+// 模型定义
+model Model {
+  id            String   @id @default(cuid())
+  name          String   // 模型名称
+  version       String   // 版本
+  totalParams   Float    // 参数量(亿)
+  quantization  String   // 量化方式 (q4_k_m, q8_0, fp16等)
+  totalShards   Int      // 总分片数
+  totalSize     Float    // 总大小(GB)
+  status        String   @default("pending") // pending, downloading, ready, error
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // 关联
+  shards        ModelShard[]
+}
+
+// 模型分片
+model ModelShard {
+  id            String   @id @default(cuid())
+  modelId       String
+  shardIndex    Int      // 分片索引
+  layerStart    Int      // 起始层
+  layerEnd      Int      // 结束层
+  size          Float    // 分片大小(GB)
+  checksum      String?  // 校验和
+  downloadUrl   String?  // 下载地址
+  nodeId        String?  // 存储节点ID
+  status        String   @default("pending") // pending, downloading, ready, error
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // 关联
+  model         Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  node          ComputeNode? @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+  
+  @@unique([modelId, shardIndex])
+}
+
+// 推理任务
+model Task {
+  id            String   @id @default(cuid())
+  taskId        String   @unique // 任务唯一标识
+  type          String   // inference, embedding, batch
+  modelId       String?  // 使用的模型
+  prompt        String   // 输入提示
+  result        String?  // 结果
+  status        String   @default("pending") // pending, running, completed, failed
+  priority      Int      @default(0) // 优先级
+  tokensUsed    Int      @default(0) // 使用的token数
+  latency       Int?     // 延迟(ms)
+  errorMessage  String?  // 错误信息
+  nodeId        String?  // 执行节点
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  completedAt   DateTime?
+  
+  // 关联
+  node          ComputeNode? @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+}
+
+// 系统配置
+model SystemConfig {
+  id            String   @id @default(cuid())
+  key           String   @unique
+  value         String
+  description   String?
+  updatedAt     DateTime @updatedAt
+}
+
+// 系统日志
+model SystemLog {
+  id            String   @id @default(cuid())
+  level         String   // info, warn, error
+  source        String   // 来源
+  message       String   // 消息
+  details       String?  // 详细信息(JSON)
+  createdAt     DateTime @default(now())
+}
